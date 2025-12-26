@@ -266,8 +266,6 @@ class Mid360AutoLevelCalibNode(object):
         self.max_gyro_mean = float(rospy.get_param("~max_gyro_mean", 0.15))  # rad/s
         # Livox IMU 的加速度单位在不同固件/驱动组合中可能是 m/s^2 或 g。
         # 这里默认允许两种范围：约 1g（~1.0）或约 9.81m/s^2。
-        self.min_acc_norm = float(rospy.get_param("~min_acc_norm", 0.5))
-        self.max_acc_norm = float(rospy.get_param("~max_acc_norm", 15.0))
         self.acc_norm_target_g = float(rospy.get_param("~acc_norm_target_g", 1.0))
         self.acc_norm_target_ms2 = float(rospy.get_param("~acc_norm_target_ms2", 9.81))
         self.acc_norm_tol_g = float(rospy.get_param("~acc_norm_tol_g", 0.5))          # accept [0.5, 1.5] by default
@@ -283,16 +281,24 @@ class Mid360AutoLevelCalibNode(object):
         self.rviz_config = rospy.get_param("~rviz_config", "")
         # 仅在“检查 + 标定”阶段静音驱动输出，避免刷屏（日志仍会写入 ROS 日志目录）。
         self.quiet_calib_driver = bool(rospy.get_param("~quiet_calib_driver", True))
+        # 校准完成后，正式运行阶段也静音驱动输出（默认开启，避免长期刷屏）。
+        self.quiet_final_driver = bool(rospy.get_param("~quiet_final_driver", True))
 
         # optional: specify which lidar ip in config to modify (useful for multi-lidar json)
         self.target_lidar_ip = rospy.get_param("~target_lidar_ip", "")
         if self.target_lidar_ip == "":
             self.target_lidar_ip = None
 
-    def _start_driver(self, user_config_path, quiet=False):
+    def _start_driver(self, user_config_path, quiet=False, force_output_to_ros=False):
         # set global params expected by C++ node (same names as launch files)
         # keep whatever already on param server; only override user_config_path
         rospy.set_param("/user_config_path", user_config_path)
+        
+        # In calibration stage, force output_data_type=0 (publish to ROS topics)
+        # so we can receive IMU/lidar data for checking/calibration.
+        # Otherwise when output_type=1 (bag only), topics won't be published.
+        if force_output_to_ros:
+            rospy.set_param("/output_data_type", 0)
 
         output_mode = "log" if quiet else "screen"
         node = roslaunch.core.Node(
@@ -402,8 +408,11 @@ class Mid360AutoLevelCalibNode(object):
         raw_cfg = _make_raw_config(base_cfg, lidar_ip=self.target_lidar_ip)
         _dump_json(self.raw_config_path, raw_cfg)
 
+        # Save user's original output_type and force to 0 (ROS topic) during calibration
+        user_output_type = rospy.get_param("/output_data_type", 0)
+        
         rospy.loginfo("Starting livox driver for data check/calibration with raw config: %s", self.raw_config_path)
-        self._start_driver(self.raw_config_path, quiet=self.quiet_calib_driver)
+        self._start_driver(self.raw_config_path, quiet=self.quiet_calib_driver, force_output_to_ros=True)
 
         # 2) check data OK
         rospy.loginfo("Checking lidar and imu topics are alive: lidar=%s imu=%s", self.lidar_topic, self.imu_topic)
@@ -434,7 +443,9 @@ class Mid360AutoLevelCalibNode(object):
         rospy.loginfo("Restarting livox driver with calibrated config")
         self._stop_driver()
         time.sleep(0.5)
-        self._start_driver(self.output_config_path, quiet=False)
+        # Restore user's original output_type setting
+        rospy.set_param("/output_data_type", user_output_type)
+        self._start_driver(self.output_config_path, quiet=self.quiet_final_driver, force_output_to_ros=False)
 
         # 6) optionally start RViz
         self._start_rviz()
