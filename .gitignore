@@ -1,4 +1,9 @@
 .vscode
 build
-package.xml
 __pycache__
+devel
+install
+log
+*.pyc
+.catkin_tools
+.idea
