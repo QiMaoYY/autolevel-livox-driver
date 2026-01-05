@@ -13,6 +13,7 @@ import sys
 import time
 
 import rospy
+import roslaunch
 import rospkg
 
 from sensor_msgs.msg import Imu
@@ -226,13 +227,13 @@ class _ImuAccumulator(object):
 
 def main():
     parser = argparse.ArgumentParser(description="MID360 auto-level calibration")
-    parser.add_argument("--base-config", type=str, default="", help="Base config json path (default: package config/MID360_config.json)")
-    parser.add_argument("--imu-topic", type=str, default="/livox/imu", help="IMU topic name")
-    parser.add_argument("--lidar-topic", type=str, default="/livox/lidar", help="Lidar topic name")
+    parser.add_argument("--base-config", type=str, default="", help="Base config json path")
+    parser.add_argument("--imu-topic", type=str, default="/livox/imu", help="IMU topic")
+    parser.add_argument("--lidar-topic", type=str, default="/livox/lidar", help="Lidar topic")
     parser.add_argument("--duration", type=float, default=3.0, help="Calibration duration (s)")
     parser.add_argument("--timeout", type=float, default=8.0, help="Data check timeout (s)")
-    parser.add_argument("--target-ip", type=str, default="", help="Target lidar IP (empty=all)")
-    parser.add_argument("--fasterlio-yaml", type=str, default="", help="faster-lio yaml to update extrinsic_T")
+    parser.add_argument("--target-ip", type=str, default="", help="Target lidar IP")
+    parser.add_argument("--fasterlio-yaml", type=str, default="", help="faster-lio yaml to update")
     args = parser.parse_args()
 
     rospy.init_node("mid360_autolevel_calib", anonymous=False)
@@ -240,6 +241,7 @@ def main():
     pkg_path = rospkg.RosPack().get_path("livox_ros_driver2")
     base_cfg_path = args.base_config if args.base_config else os.path.join(pkg_path, "config", "MID360_config.json")
     output_cfg_path = os.path.join(pkg_path, "config", "MID360_config_calib.json")
+    temp_raw_cfg_path = "/tmp/MID360_config_raw_extrinsic0.json"
     
     target_ip = args.target_ip if args.target_ip else None
     
@@ -248,70 +250,104 @@ def main():
     
     base_cfg = _load_json(base_cfg_path)
 
-    # 1) check data OK
-    rospy.loginfo("Checking lidar and imu topics: lidar=%s imu=%s", args.lidar_topic, args.imu_topic)
-    xfer_format = int(rospy.get_param("/xfer_format", 0))
-    if xfer_format == 0:
-        _wait_for_topic_message(args.lidar_topic, PointCloud2, args.timeout)
-    else:
-        if CustomMsg is None:
-            raise RuntimeError("xfer_format != 0 but livox_ros_driver2/CustomMsg not available")
-        _wait_for_topic_message(args.lidar_topic, CustomMsg, args.timeout)
-    _wait_for_topic_message(args.imu_topic, Imu, args.timeout)
-    rospy.loginfo("Topics OK")
+    # Prepare raw config (extrinsic RPY=0) for calibration
+    raw_cfg = _make_raw_config(base_cfg, lidar_ip=target_ip)
+    _dump_json(temp_raw_cfg_path, raw_cfg)
 
-    # 2) calibrate
-    rospy.loginfo("Calibrating... keep robot static for %.2f seconds", args.duration)
-    acc = _ImuAccumulator()
+    # Start livox driver temporarily with raw config
+    rospy.loginfo("Starting livox driver for calibration...")
+    rospy.set_param("/user_config_path", temp_raw_cfg_path)
+    rospy.set_param("/output_data_type", 0)  # force publish to topics
 
-    def cb(msg):
-        acc.push(msg)
+    uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+    roslaunch.configure_logging(uuid)
+    launch = roslaunch.scriptapi.ROSLaunch()
+    launch.start()
 
-    sub = rospy.Subscriber(args.imu_topic, Imu, cb, queue_size=2000)
+    node = roslaunch.core.Node(
+        package="livox_ros_driver2",
+        node_type="livox_ros_driver2_node",
+        name="livox_lidar_publisher2",
+        output="log",
+        respawn=False,
+    )
+    proc = launch.launch(node)
+    if not proc or not proc.is_alive():
+        raise RuntimeError("failed to start livox driver")
+
     try:
-        t0 = time.time()
-        rate = rospy.Rate(200)
-        while not rospy.is_shutdown() and (time.time() - t0) < args.duration:
-            rate.sleep()
-        m = acc.mean()
-    finally:
+        # Check data OK
+        rospy.loginfo("Checking topics: lidar=%s imu=%s", args.lidar_topic, args.imu_topic)
+        xfer_format = int(rospy.get_param("/xfer_format", 0))
+        if xfer_format == 0:
+            _wait_for_topic_message(args.lidar_topic, PointCloud2, args.timeout)
+        else:
+            if CustomMsg is None:
+                raise RuntimeError("xfer_format != 0 but CustomMsg not available")
+            _wait_for_topic_message(args.lidar_topic, CustomMsg, args.timeout)
+        _wait_for_topic_message(args.imu_topic, Imu, args.timeout)
+        rospy.loginfo("Topics OK")
+
+        # Calibrate
+        rospy.loginfo("Calibrating... keep robot static for %.2f seconds", args.duration)
+        acc = _ImuAccumulator()
+
+        def cb(msg):
+            acc.push(msg)
+
+        sub = rospy.Subscriber(args.imu_topic, Imu, cb, queue_size=2000)
         try:
+            t0 = time.time()
+            rate = rospy.Rate(200)
+            while not rospy.is_shutdown() and (time.time() - t0) < args.duration:
+                rate.sleep()
+            m = acc.mean()
+        finally:
             sub.unregister()
+
+        if m["n"] < 200:
+            raise RuntimeError("imu samples too few: %d < 200" % m["n"])
+        if m["gyro_norm"] > 0.15:
+            raise RuntimeError("robot not static? gyro_norm: %.4f rad/s" % m["gyro_norm"])
+        
+        acc_norm = m["acc_norm"]
+        ok_g = abs(acc_norm - 1.0) <= 0.5
+        ok_ms2 = abs(acc_norm - 9.81) <= 4.0
+        if not (ok_g or ok_ms2):
+            raise RuntimeError("acc norm abnormal: %.3f" % acc_norm)
+
+        ax, ay, az = m["ax"], m["ay"], m["az"]
+        roll = math.atan2(ay, az)
+        pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+        roll_deg = _deg(roll)
+        pitch_deg = _deg(pitch)
+        
+        rospy.loginfo("Calibration done: roll=%.3f deg, pitch=%.3f deg (n=%d, acc_norm=%.3f)",
+                      roll_deg, pitch_deg, m["n"], acc_norm)
+
+        # Write calibrated config
+        out_cfg = _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=target_ip)
+        _dump_json(output_cfg_path, out_cfg)
+        rospy.loginfo("Wrote calibrated config: %s", output_cfg_path)
+
+        # Optionally update faster-lio yaml
+        if args.fasterlio_yaml:
+            rospy.loginfo("Updating faster-lio yaml: %s", args.fasterlio_yaml)
+            _update_fasterlio_yaml_extrinsic_t(args.fasterlio_yaml, roll_deg, pitch_deg, backup=True)
+            rospy.loginfo("Updated faster-lio yaml")
+
+    finally:
+        # Stop driver
+        try:
+            proc.stop()
+        except Exception:
+            pass
+        try:
+            launch.shutdown()
         except Exception:
             pass
 
-    if m["n"] < 200:
-        raise RuntimeError("imu samples too few: %d < 200" % m["n"])
-    if m["gyro_norm"] > 0.15:
-        raise RuntimeError("robot not static? mean gyro norm: %.4f rad/s" % m["gyro_norm"])
-    
-    acc_norm = m["acc_norm"]
-    ok_g = abs(acc_norm - 1.0) <= 0.5
-    ok_ms2 = abs(acc_norm - 9.81) <= 4.0
-    if not (ok_g or ok_ms2):
-        raise RuntimeError("acc norm abnormal: %.3f (expected ~1.0g or ~9.81m/s^2)" % acc_norm)
-
-    ax, ay, az = m["ax"], m["ay"], m["az"]
-    roll = math.atan2(ay, az)
-    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
-    roll_deg = _deg(roll)
-    pitch_deg = _deg(pitch)
-    
-    rospy.loginfo("Calibration done: roll=%.3f deg, pitch=%.3f deg (n=%d, gyro_norm=%.5f, acc_norm=%.3f)",
-                  roll_deg, pitch_deg, m["n"], m["gyro_norm"], acc_norm)
-
-    # 3) write calibrated config
-    out_cfg = _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=target_ip)
-    _dump_json(output_cfg_path, out_cfg)
-    rospy.loginfo("Wrote calibrated config: %s", output_cfg_path)
-
-    # 4) optionally update faster-lio yaml
-    if args.fasterlio_yaml:
-        rospy.loginfo("Updating faster-lio yaml extrinsic_T: %s", args.fasterlio_yaml)
-        _update_fasterlio_yaml_extrinsic_t(args.fasterlio_yaml, roll_deg, pitch_deg, backup=True)
-        rospy.loginfo("Updated faster-lio yaml (backup created)")
-
-    rospy.loginfo("Calibration finished. Exiting.")
+    rospy.loginfo("Calibration finished.")
 
 
 if __name__ == "__main__":
