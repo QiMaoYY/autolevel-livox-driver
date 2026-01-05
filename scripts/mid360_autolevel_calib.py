@@ -3,16 +3,16 @@
 """
 MID360 Auto-level calibration (ROS1)
 """
+import argparse
 import json
 import math
 import os
 import re
-import signal
 import shutil
+import sys
 import time
 
 import rospy
-import roslaunch
 import rospkg
 
 from sensor_msgs.msg import Imu
@@ -33,9 +33,6 @@ def _norm3(x, y, z):
 
 
 def _wait_for_topic_message(topic, msg_type, timeout_s):
-    """
-    Wait until a topic message is received.
-    """
     start = time.time()
     while not rospy.is_shutdown():
         left = timeout_s - (time.time() - start)
@@ -61,10 +58,6 @@ def _dump_json(path, obj):
 
 
 def _calc_rotation_matrix_deg_rp(roll_deg, pitch_deg):
-    """
-    Match livox_ros_driver2 convention (same as pub_handler.cpp) with yaw=0:
-      R = Ry(pitch) * Rx(roll)
-    """
     roll = float(roll_deg) * math.pi / 180.0
     pitch = float(pitch_deg) * math.pi / 180.0
     cr = math.cos(roll)
@@ -87,13 +80,6 @@ def _mat3_mul_vec3(R, v):
 
 
 def _update_fasterlio_yaml_extrinsic_t(yaml_path, roll_deg, pitch_deg, backup=True):
-    """
-    Update faster-lio mapping/extrinsic_T in-place, and preserve factory value in a comment.
-
-    In faster-lio, extrinsic_T is `lidar_T_wrt_IMU` (lidar origin expressed in IMU frame).
-    If we rotate IMU/LiDAR frames by the same leveling rotation R, translation coordinates should be:
-      T_new = R * T_factory
-    """
     if not yaml_path:
         return False
     if not os.path.exists(yaml_path):
@@ -102,7 +88,6 @@ def _update_fasterlio_yaml_extrinsic_t(yaml_path, roll_deg, pitch_deg, backup=Tr
     with open(yaml_path, "r") as f:
         raw_lines = f.readlines()
 
-    # Repair previously-written literal "\n" sequences (keep file readable as YAML).
     lines = []
     for line in raw_lines:
         if "\\n" in line:
@@ -118,14 +103,12 @@ def _update_fasterlio_yaml_extrinsic_t(yaml_path, roll_deg, pitch_deg, backup=Tr
 
     idx = None
     for i, line in enumerate(lines):
-        # match: optional indent + "extrinsic_T: ["
         if re.match(r"^\s*extrinsic_T\s*:\s*\[", line):
             idx = i
             break
     if idx is None:
         raise RuntimeError("cannot find 'extrinsic_T:' in %s" % yaml_path)
 
-    # extract list inside [ ... ]
     m = re.search(r"\[\s*([^\]]+)\s*\]", lines[idx])
     if not m:
         raise RuntimeError("failed to parse extrinsic_T list in %s" % yaml_path)
@@ -156,9 +139,6 @@ def _update_fasterlio_yaml_extrinsic_t(yaml_path, roll_deg, pitch_deg, backup=Tr
 
 
 def _make_raw_config(base_cfg, lidar_ip=None):
-    """
-    Copy base config but set extrinsic roll/pitch/yaw to zero for the target lidar.
-    """
     cfg = json.loads(json.dumps(base_cfg))
     if "lidar_configs" not in cfg or not cfg["lidar_configs"]:
         raise RuntimeError("invalid config: missing lidar_configs")
@@ -177,9 +157,6 @@ def _make_raw_config(base_cfg, lidar_ip=None):
 
 
 def _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=None):
-    """
-    Copy base config, only overwrite extrinsic roll/pitch (keep yaw & translation).
-    """
     cfg = json.loads(json.dumps(base_cfg))
     if "lidar_configs" not in cfg or not cfg["lidar_configs"]:
         raise RuntimeError("invalid config: missing lidar_configs")
@@ -189,7 +166,6 @@ def _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=None):
         if lidar_ip is not None and lc.get("ip") != lidar_ip:
             continue
         ext = lc.get("extrinsic_parameter", {})
-        # only change roll/pitch; keep yaw and xyz untouched
         ext["roll"] = float(roll_deg)
         ext["pitch"] = float(pitch_deg)
         lc["extrinsic_parameter"] = ext
@@ -248,238 +224,99 @@ class _ImuAccumulator(object):
         }
 
 
-class Mid360AutoLevelCalibNode(object):
-    def __init__(self):
-        self.uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
-        roslaunch.configure_logging(self.uuid)
-        self.launch = roslaunch.scriptapi.ROSLaunch()
-        self.launch.start()
+def main():
+    parser = argparse.ArgumentParser(description="MID360 auto-level calibration")
+    parser.add_argument("--base-config", type=str, default="", help="Base config json path (default: package config/MID360_config.json)")
+    parser.add_argument("--imu-topic", type=str, default="/livox/imu", help="IMU topic name")
+    parser.add_argument("--lidar-topic", type=str, default="/livox/lidar", help="Lidar topic name")
+    parser.add_argument("--duration", type=float, default=3.0, help="Calibration duration (s)")
+    parser.add_argument("--timeout", type=float, default=8.0, help="Data check timeout (s)")
+    parser.add_argument("--target-ip", type=str, default="", help="Target lidar IP (empty=all)")
+    parser.add_argument("--fasterlio-yaml", type=str, default="", help="faster-lio yaml to update extrinsic_T")
+    args = parser.parse_args()
 
-        self.proc_driver = None
-        self.proc_rviz = None
+    rospy.init_node("mid360_autolevel_calib", anonymous=False)
 
-        self.imu_topic = rospy.get_param("~imu_topic", "/livox/imu")
-        self.lidar_topic = rospy.get_param("~lidar_topic", "/livox/lidar")
-        self.check_timeout = float(rospy.get_param("~check_timeout", 8.0))
-        self.calib_duration = float(rospy.get_param("~calib_duration", 3.0))
-        self.min_samples = int(rospy.get_param("~min_samples", 200))
-        self.max_gyro_mean = float(rospy.get_param("~max_gyro_mean", 0.15))  # rad/s
-        # Livox IMU 的加速度单位在不同固件/驱动组合中可能是 m/s^2 或 g。
-        # 这里默认允许两种范围：约 1g（~1.0）或约 9.81m/s^2。
-        self.acc_norm_target_g = float(rospy.get_param("~acc_norm_target_g", 1.0))
-        self.acc_norm_target_ms2 = float(rospy.get_param("~acc_norm_target_ms2", 9.81))
-        self.acc_norm_tol_g = float(rospy.get_param("~acc_norm_tol_g", 0.5))          # accept [0.5, 1.5] by default
-        self.acc_norm_tol_ms2 = float(rospy.get_param("~acc_norm_tol_ms2", 4.0))      # accept [5.81, 13.81] by default
+    pkg_path = rospkg.RosPack().get_path("livox_ros_driver2")
+    base_cfg_path = args.base_config if args.base_config else os.path.join(pkg_path, "config", "MID360_config.json")
+    output_cfg_path = os.path.join(pkg_path, "config", "MID360_config_calib.json")
+    
+    target_ip = args.target_ip if args.target_ip else None
+    
+    rospy.loginfo("Base config: %s", base_cfg_path)
+    rospy.loginfo("Output config: %s", output_cfg_path)
+    
+    base_cfg = _load_json(base_cfg_path)
 
-        self.output_config_path = rospy.get_param("~output_config_path", "/tmp/MID360_config_autolevel.json")
-        self.raw_config_path = rospy.get_param("~raw_config_path", "/tmp/MID360_config_raw_extrinsic0.json")
-        # optional: update faster-lio yaml extrinsic_T in-place (preserve factory value in comment)
-        self.fasterlio_yaml_path = rospy.get_param("~fasterlio_yaml_path", "")
-        self.fasterlio_yaml_backup = bool(rospy.get_param("~fasterlio_yaml_backup", True))
+    # 1) check data OK
+    rospy.loginfo("Checking lidar and imu topics: lidar=%s imu=%s", args.lidar_topic, args.imu_topic)
+    xfer_format = int(rospy.get_param("/xfer_format", 0))
+    if xfer_format == 0:
+        _wait_for_topic_message(args.lidar_topic, PointCloud2, args.timeout)
+    else:
+        if CustomMsg is None:
+            raise RuntimeError("xfer_format != 0 but livox_ros_driver2/CustomMsg not available")
+        _wait_for_topic_message(args.lidar_topic, CustomMsg, args.timeout)
+    _wait_for_topic_message(args.imu_topic, Imu, args.timeout)
+    rospy.loginfo("Topics OK")
 
-        self.start_rviz = bool(rospy.get_param("~start_rviz", False))
-        self.rviz_config = rospy.get_param("~rviz_config", "")
-        # 仅在“检查 + 标定”阶段静音驱动输出，避免刷屏（日志仍会写入 ROS 日志目录）。
-        self.quiet_calib_driver = bool(rospy.get_param("~quiet_calib_driver", True))
-        # 校准完成后，正式运行阶段也静音驱动输出（默认开启，避免长期刷屏）。
-        self.quiet_final_driver = bool(rospy.get_param("~quiet_final_driver", True))
+    # 2) calibrate
+    rospy.loginfo("Calibrating... keep robot static for %.2f seconds", args.duration)
+    acc = _ImuAccumulator()
 
-        # optional: specify which lidar ip in config to modify (useful for multi-lidar json)
-        self.target_lidar_ip = rospy.get_param("~target_lidar_ip", "")
-        if self.target_lidar_ip == "":
-            self.target_lidar_ip = None
+    def cb(msg):
+        acc.push(msg)
 
-    def _start_driver(self, user_config_path, quiet=False, force_output_to_ros=False):
-        # set global params expected by C++ node (same names as launch files)
-        # keep whatever already on param server; only override user_config_path
-        rospy.set_param("/user_config_path", user_config_path)
-        
-        # In calibration stage, force output_data_type=0 (publish to ROS topics)
-        # so we can receive IMU/lidar data for checking/calibration.
-        # Otherwise when output_type=1 (bag only), topics won't be published.
-        if force_output_to_ros:
-            rospy.set_param("/output_data_type", 0)
-
-        output_mode = "log" if quiet else "screen"
-        node = roslaunch.core.Node(
-            package="livox_ros_driver2",
-            node_type="livox_ros_driver2_node",
-            name="livox_lidar_publisher2",
-            output=output_mode,
-            respawn=False,
-        )
-        self.proc_driver = self.launch.launch(node)
-        if not self.proc_driver or not self.proc_driver.is_alive():
-            raise RuntimeError("failed to start livox_ros_driver2_node via roslaunch python API")
-
-    def _stop_driver(self):
-        if self.proc_driver is not None:
-            try:
-                self.proc_driver.stop()
-            except Exception:
-                pass
-            self.proc_driver = None
-
-    def _start_rviz(self):
-        if not self.start_rviz:
-            return
-        if not self.rviz_config:
-            # fall back to package default
-            pkg_path = rospkg.RosPack().get_path("livox_ros_driver2")
-            self.rviz_config = os.path.join(pkg_path, "config", "display_point_cloud_ROS1.rviz")
-
-        node = roslaunch.core.Node(
-            package="rviz",
-            node_type="rviz",
-            name="livox_rviz",
-            output="screen",
-            respawn=True,
-            args="-d %s" % self.rviz_config,
-        )
-        self.proc_rviz = self.launch.launch(node)
-
-    def _stop_rviz(self):
-        if self.proc_rviz is not None:
-            try:
-                self.proc_rviz.stop()
-            except Exception:
-                pass
-            self.proc_rviz = None
-
-    def _check_data_ok(self):
-        xfer_format = int(rospy.get_param("/xfer_format", 0))
-        if xfer_format == 0:
-            _wait_for_topic_message(self.lidar_topic, PointCloud2, self.check_timeout)
-        else:
-            if CustomMsg is None:
-                raise RuntimeError("xfer_format != 0 but livox_ros_driver2/CustomMsg not available in python env")
-            _wait_for_topic_message(self.lidar_topic, CustomMsg, self.check_timeout)
-        _wait_for_topic_message(self.imu_topic, Imu, self.check_timeout)
-
-    def _calibrate_from_imu(self):
-        acc = _ImuAccumulator()
-
-        def cb(msg):
-            acc.push(msg)
-
-        sub = rospy.Subscriber(self.imu_topic, Imu, cb, queue_size=2000)
+    sub = rospy.Subscriber(args.imu_topic, Imu, cb, queue_size=2000)
+    try:
+        t0 = time.time()
+        rate = rospy.Rate(200)
+        while not rospy.is_shutdown() and (time.time() - t0) < args.duration:
+            rate.sleep()
+        m = acc.mean()
+    finally:
         try:
-            t0 = time.time()
-            rate = rospy.Rate(200)
-            while not rospy.is_shutdown() and (time.time() - t0) < self.calib_duration:
-                rate.sleep()
-            m = acc.mean()
-        finally:
-            try:
-                sub.unregister()
-            except Exception:
-                pass
-
-        if m["n"] < self.min_samples:
-            raise RuntimeError("imu samples too few: %d < %d" % (m["n"], self.min_samples))
-        if m["gyro_norm"] > self.max_gyro_mean:
-            raise RuntimeError("robot not static? mean gyro norm too large: %.4f rad/s" % m["gyro_norm"])
-        acc_norm = m["acc_norm"]
-        # 兼容 g 与 m/s^2 两种常见单位；roll/pitch 计算本身与比例无关，所以只做合理性检查。
-        ok_g = abs(acc_norm - self.acc_norm_target_g) <= self.acc_norm_tol_g
-        ok_ms2 = abs(acc_norm - self.acc_norm_target_ms2) <= self.acc_norm_tol_ms2
-        if not (ok_g or ok_ms2):
-            raise RuntimeError(
-                "acc norm abnormal: %.3f (expected about %.2f±%.2f [g] or %.2f±%.2f [m/s^2])"
-                % (acc_norm, self.acc_norm_target_g, self.acc_norm_tol_g, self.acc_norm_target_ms2, self.acc_norm_tol_ms2)
-            )
-
-        ax, ay, az = m["ax"], m["ay"], m["az"]
-        # classic roll/pitch from accelerometer (ignore yaw)
-        roll = math.atan2(ay, az)
-        pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
-        return _deg(roll), _deg(pitch), m
-
-    def run(self):
-        # resolve base config path
-        base_cfg_path = rospy.get_param("/user_config_path", "")
-        if not base_cfg_path:
-            pkg_path = rospkg.RosPack().get_path("livox_ros_driver2")
-            base_cfg_path = os.path.join(pkg_path, "config", "MID360_config.json")
-
-        base_cfg = _load_json(base_cfg_path)
-
-        # 1) start driver with raw extrinsic (RPY=0) for calibration
-        raw_cfg = _make_raw_config(base_cfg, lidar_ip=self.target_lidar_ip)
-        _dump_json(self.raw_config_path, raw_cfg)
-
-        # Save user's original output_type and force to 0 (ROS topic) during calibration
-        user_output_type = rospy.get_param("/output_data_type", 0)
-        
-        rospy.loginfo("Starting livox driver for data check/calibration with raw config: %s", self.raw_config_path)
-        self._start_driver(self.raw_config_path, quiet=self.quiet_calib_driver, force_output_to_ros=True)
-
-        # 2) check data OK
-        rospy.loginfo("Checking lidar and imu topics are alive: lidar=%s imu=%s", self.lidar_topic, self.imu_topic)
-        self._check_data_ok()
-
-        # 3) calib
-        rospy.loginfo("Calibrating... keep robot static for %.2f seconds", self.calib_duration)
-        roll_deg, pitch_deg, stats = self._calibrate_from_imu()
-        rospy.loginfo("Calibration done: roll=%.3f deg pitch=%.3f deg (n=%d, gyro_norm=%.5f, acc_norm=%.3f)",
-                      roll_deg, pitch_deg, stats["n"], stats["gyro_norm"], stats["acc_norm"])
-
-        # 4) write final config (only overwrite roll/pitch)
-        out_cfg = _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=self.target_lidar_ip)
-        _dump_json(self.output_config_path, out_cfg)
-        rospy.loginfo("Wrote calibrated config: %s", self.output_config_path)
-
-        if self.fasterlio_yaml_path:
-            rospy.loginfo("Updating faster-lio yaml extrinsic_T: %s", self.fasterlio_yaml_path)
-            _update_fasterlio_yaml_extrinsic_t(
-                self.fasterlio_yaml_path,
-                roll_deg,
-                pitch_deg,
-                backup=self.fasterlio_yaml_backup,
-            )
-            rospy.loginfo("Updated faster-lio yaml done (backup=%s).", str(self.fasterlio_yaml_backup))
-
-        # 5) restart driver with calibrated config
-        rospy.loginfo("Restarting livox driver with calibrated config")
-        self._stop_driver()
-        time.sleep(0.5)
-        # Restore user's original output_type setting
-        rospy.set_param("/output_data_type", user_output_type)
-        self._start_driver(self.output_config_path, quiet=self.quiet_final_driver, force_output_to_ros=False)
-
-        # 6) optionally start RViz
-        self._start_rviz()
-
-        rospy.loginfo("Auto-level pipeline finished. Driver is running with calibrated extrinsic. Node will stay alive.")
-
-    def shutdown(self):
-        self._stop_rviz()
-        self._stop_driver()
-        try:
-            self.launch.shutdown()
+            sub.unregister()
         except Exception:
             pass
 
+    if m["n"] < 200:
+        raise RuntimeError("imu samples too few: %d < 200" % m["n"])
+    if m["gyro_norm"] > 0.15:
+        raise RuntimeError("robot not static? mean gyro norm: %.4f rad/s" % m["gyro_norm"])
+    
+    acc_norm = m["acc_norm"]
+    ok_g = abs(acc_norm - 1.0) <= 0.5
+    ok_ms2 = abs(acc_norm - 9.81) <= 4.0
+    if not (ok_g or ok_ms2):
+        raise RuntimeError("acc norm abnormal: %.3f (expected ~1.0g or ~9.81m/s^2)" % acc_norm)
 
-def main():
-    rospy.init_node("mid360_autolevel_calib", anonymous=False)
-    node = Mid360AutoLevelCalibNode()
+    ax, ay, az = m["ax"], m["ay"], m["az"]
+    roll = math.atan2(ay, az)
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    roll_deg = _deg(roll)
+    pitch_deg = _deg(pitch)
+    
+    rospy.loginfo("Calibration done: roll=%.3f deg, pitch=%.3f deg (n=%d, gyro_norm=%.5f, acc_norm=%.3f)",
+                  roll_deg, pitch_deg, m["n"], m["gyro_norm"], acc_norm)
 
-    def _on_shutdown():
-        node.shutdown()
+    # 3) write calibrated config
+    out_cfg = _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=target_ip)
+    _dump_json(output_cfg_path, out_cfg)
+    rospy.loginfo("Wrote calibrated config: %s", output_cfg_path)
 
-    rospy.on_shutdown(_on_shutdown)
-    try:
-        node.run()
-        rospy.spin()
-    except Exception as e:
-        rospy.logerr("mid360_autolevel_calib failed: %s", str(e))
-        node.shutdown()
-        # make roslaunch stop (required=true will shutdown the launch)
-        os.kill(os.getpid(), signal.SIGINT)
+    # 4) optionally update faster-lio yaml
+    if args.fasterlio_yaml:
+        rospy.loginfo("Updating faster-lio yaml extrinsic_T: %s", args.fasterlio_yaml)
+        _update_fasterlio_yaml_extrinsic_t(args.fasterlio_yaml, roll_deg, pitch_deg, backup=True)
+        rospy.loginfo("Updated faster-lio yaml (backup created)")
+
+    rospy.loginfo("Calibration finished. Exiting.")
 
 
 if __name__ == "__main__":
-    main()
-
-
+    try:
+        main()
+    except Exception as e:
+        rospy.logerr("Calibration failed: %s", str(e))
+        sys.exit(1)

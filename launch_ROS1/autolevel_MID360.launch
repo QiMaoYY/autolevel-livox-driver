@@ -1,39 +1,21 @@
 <launch>
 
-	<!-- user configure parameters for ros start -->
+	<!--user configure parameters for ros start-->
 	<arg name="lvx_file_path" default="livox_test.lvx"/>
 	<arg name="bd_list" default="100000000000000"/>
-	<arg name="xfer_format" default="0"/>
+	<arg name="xfer_format" default="1"/>
 	<arg name="multi_topic" default="0"/>
 	<arg name="data_src" default="0"/>
 	<arg name="publish_freq" default="10.0"/>
 	<arg name="output_type" default="0"/>
-	<arg name="rviz_enable" default="true"/>
+	<arg name="rviz_enable" default="false"/>
 	<arg name="rosbag_enable" default="false"/>
 	<arg name="cmdline_arg" default="$(arg bd_list)"/>
 	<arg name="msg_frame_id" default="livox_frame"/>
 	<arg name="lidar_bag" default="true"/>
 	<arg name="imu_bag" default="true"/>
-	<!-- user configure parameters for ros end -->
+	<!--user configure parameters for ros end--> 
 
-	<!-- auto-level calibration params -->
-	<arg name="calib_duration" default="3.0"/>
-	<arg name="check_timeout" default="8.0"/>
-	<arg name="imu_topic" default="/livox/imu"/>
-	<arg name="lidar_topic" default="/livox/lidar"/>
-	<arg name="output_config_path" default="/tmp/MID360_config_autolevel.json"/>
-	<arg name="raw_config_path" default="/tmp/MID360_config_raw_extrinsic0.json"/>
-	<!-- suppress driver stdout/stderr during check+calib stage -->
-	<arg name="quiet_calib_driver" default="true"/>
-	<!-- suppress driver output after calibration (final running stage) -->
-	<arg name="quiet_final_driver" default="true"/>
-	<!-- optional: update faster-lio extrinsic_T in yaml (in-place). Empty means disabled -->
-	<arg name="fasterlio_yaml_path" default="$(find faster_lio)/config/mid360.yaml"/>
-	<arg name="fasterlio_yaml_backup" default="true"/>
-	<!-- optional: if your json contains multiple lidars, set ip to choose one -->
-	<arg name="target_lidar_ip" default=""/>
-
-	<!-- Keep the same global params as original launch (driver reads them) -->
 	<param name="xfer_format" value="$(arg xfer_format)"/>
 	<param name="multi_topic" value="$(arg multi_topic)"/>
 	<param name="data_src" value="$(arg data_src)"/>
@@ -41,35 +23,23 @@
 	<param name="output_data_type" value="$(arg output_type)"/>
 	<param name="cmdline_str" type="string" value="$(arg bd_list)"/>
 	<param name="cmdline_file_path" type="string" value="$(arg lvx_file_path)"/>
-	<param name="user_config_path" type="string" value="$(find livox_ros_driver2)/config/MID360_config.json"/>
+	<param name="user_config_path" type="string" value="$(find livox_ros_driver2)/config/MID360_config_calib.json"/>
 	<param name="frame_id" type="string" value="$(arg msg_frame_id)"/>
 	<param name="enable_lidar_bag" type="bool" value="$(arg lidar_bag)"/>
 	<param name="enable_imu_bag" type="bool" value="$(arg imu_bag)"/>
 
-	<!-- Orchestrator node: check -> calib -> write temp json -> restart driver -> start rviz -->
-	<node name="mid360_autolevel_calib" pkg="livox_ros_driver2"
-	      type="mid360_autolevel_calib.py" required="true" output="screen">
-		<param name="calib_duration" value="$(arg calib_duration)"/>
-		<param name="check_timeout" value="$(arg check_timeout)"/>
-		<param name="imu_topic" value="$(arg imu_topic)"/>
-		<param name="lidar_topic" value="$(arg lidar_topic)"/>
-		<param name="output_config_path" value="$(arg output_config_path)"/>
-		<param name="raw_config_path" value="$(arg raw_config_path)"/>
-		<param name="quiet_calib_driver" value="$(arg quiet_calib_driver)"/>
-		<param name="quiet_final_driver" value="$(arg quiet_final_driver)"/>
-		<param name="fasterlio_yaml_path" value="$(arg fasterlio_yaml_path)"/>
-		<param name="fasterlio_yaml_backup" value="$(arg fasterlio_yaml_backup)"/>
-		<param name="start_rviz" value="$(arg rviz_enable)"/>
-		<param name="rviz_config" value="$(find livox_ros_driver2)/config/display_point_cloud_ROS1.rviz"/>
-		<param name="target_lidar_ip" value="$(arg target_lidar_ip)"/>
-	</node>
+	<node name="livox_lidar_publisher2" pkg="livox_ros_driver2"
+	      type="livox_ros_driver2_node" required="true"
+	      output="screen" args="$(arg cmdline_arg)"/>
 
-	<!-- Optional: after calibration, you can still enable rosbag record from outside if needed -->
+	<group if="$(arg rviz_enable)">
+		<node name="livox_rviz" pkg="rviz" type="rviz" respawn="true"
+				args="-d $(find livox_ros_driver2)/config/display_point_cloud_ROS1.rviz"/>
+    </group>
+
 	<group if="$(arg rosbag_enable)">
     	<node pkg="rosbag" type="record" name="record" output="screen"
           		args="-a"/>
     </group>
 
 </launch>
-
-
