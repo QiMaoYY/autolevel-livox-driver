@@ -10,6 +10,7 @@ python3 $PKG_DIR/src/livox_ros_driver2/scripts/mid360_autolevel_calib.py \
     --timeout 10.0 \
     --imu-topic /livox/imu \
     --lidar-topic /livox/lidar \
+    --fasterlio-yaml /media/data/slam_ws/src/faster-lio/config/mid360.yaml \
     "${@}"
 
 echo ""
