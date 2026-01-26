@@ -332,8 +332,11 @@ def main():
 
         # Optionally update faster-lio yaml
         if args.fasterlio_yaml:
-            rospy.loginfo("Updating faster-lio yaml: %s", args.fasterlio_yaml)
-            _update_fasterlio_yaml_extrinsic_t(args.fasterlio_yaml, roll_deg, pitch_deg, backup=True)
+            map_yaml = os.path.join(os.path.dirname(args.fasterlio_yaml), "mid360_map.yaml")
+            loc_yaml = os.path.join(os.path.dirname(args.fasterlio_yaml), "mid360_loc.yaml")
+            rospy.loginfo("Updating faster-lio yaml")
+            _update_fasterlio_yaml_extrinsic_t(map_yaml, roll_deg, pitch_deg, backup=True)
+            _update_fasterlio_yaml_extrinsic_t(loc_yaml, roll_deg, pitch_deg, backup=True)
             rospy.loginfo("Updated faster-lio yaml")
 
     finally:
